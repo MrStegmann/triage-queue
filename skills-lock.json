@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "python-best-practices": {
+      "source": "alleneubank/claude-code",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/python-best-practices/SKILL.md",
+      "computedHash": "9096f9ba1660f3dc864206f05f2851f77a3872dded644514a63a509d5052466d"
+    }
+  }
+}
