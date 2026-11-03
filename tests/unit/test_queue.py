@@ -1,5 +1,8 @@
-"""Unit tests for TriageQueue priority, FIFO, and empty queue handling."""
+"""Unit tests for TriageQueue priority, FIFO, empty queue handling, and concurrency synchronization."""
 
+import concurrent.futures
+import threading
+import time
 from typing import Callable
 import pytest
 
@@ -221,4 +224,162 @@ class TestTriageQueueUS3:
         assert stats2.urgent_count == 1
         assert stats2.standard_count == 3
         assert stats2.total_count == 5
+
+
+class TestTriageQueueConcurrency:
+    """Tests for multi-worker concurrency and lock synchronization."""
+
+    def test_concurrent_enqueue_and_dequeue_multi_worker(
+        self,
+        empty_queue: TriageQueue,
+        patient_factory: Callable[..., PatientRecord],
+    ) -> None:
+        """Verify multiple producers and consumers can operate concurrently with zero double processing or loss."""
+        num_producers = 4
+        patients_per_producer = 50
+        total_patients = num_producers * patients_per_producer
+
+        # Prepare distinct patient records
+        levels = [TriageLevel.CRITICAL, TriageLevel.URGENT, TriageLevel.STANDARD]
+        producer_batches: list[list[PatientRecord]] = []
+        for p_idx in range(num_producers):
+            batch = [
+                patient_factory(
+                    name=f"WorkerPatient_{p_idx}_{i}",
+                    triage_level=levels[(p_idx + i) % 3],
+                    offset_seconds=i,
+                    patient_id=f"CONC-{p_idx}-{i}",
+                )
+                for i in range(patients_per_producer)
+            ]
+            producer_batches.append(batch)
+
+        dequeued_patients: list[PatientRecord] = []
+        dequeued_lock = threading.Lock()
+        stop_consumers = threading.Event()
+
+        def producer_worker(batch: list[PatientRecord]) -> None:
+            for patient in batch:
+                empty_queue.enqueue(patient)
+                time.sleep(0.0001)
+
+        def consumer_worker() -> None:
+            while not stop_consumers.is_set() or not empty_queue.is_empty():
+                item = empty_queue.dequeue()
+                if item is not None:
+                    with dequeued_lock:
+                        dequeued_patients.append(item)
+                else:
+                    time.sleep(0.0005)
+
+        num_consumers = 4
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_producers + num_consumers) as executor:
+            consumer_futures = [executor.submit(consumer_worker) for _ in range(num_consumers)]
+            producer_futures = [executor.submit(producer_worker, batch) for batch in producer_batches]
+
+            concurrent.futures.wait(producer_futures)
+            # Allow consumers to drain any remaining items
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                with dequeued_lock:
+                    if len(dequeued_patients) >= total_patients:
+                        break
+                time.sleep(0.001)
+
+            stop_consumers.set()
+            concurrent.futures.wait(consumer_futures)
+
+        # Assert zero double processing
+        dequeued_ids = [p.id for p in dequeued_patients]
+        assert len(dequeued_ids) == total_patients
+        assert len(set(dequeued_ids)) == total_patients, "Double processing detected!"
+
+        # Assert queue is cleanly empty
+        assert empty_queue.is_empty()
+        assert len(empty_queue) == 0
+        assert empty_queue.get_statistics().total_count == 0
+
+    def test_concurrent_readers_during_mutations(
+        self,
+        empty_queue: TriageQueue,
+        patient_factory: Callable[..., PatientRecord],
+    ) -> None:
+        """Verify list_all, peek, and get_statistics do not raise RuntimeError or corrupt during concurrent modifications."""
+        stop_event = threading.Event()
+        errors: list[BaseException] = []
+
+        def mutator() -> None:
+            counter = 0
+            while not stop_event.is_set():
+                p = patient_factory(name=f"Mut_{counter}", triage_level=TriageLevel.URGENT)
+                empty_queue.enqueue(p)
+                empty_queue.dequeue()
+                counter += 1
+
+        def reader() -> None:
+            while not stop_event.is_set():
+                try:
+                    snapshot = empty_queue.list_all()
+                    assert isinstance(snapshot, tuple)
+                    stats = empty_queue.get_statistics()
+                    assert stats.total_count == (stats.critical_count + stats.urgent_count + stats.standard_count)
+                    _ = empty_queue.peek()
+                    _ = len(empty_queue)
+                    _ = empty_queue.is_empty()
+                except (RuntimeError, IndexError, ValueError, AssertionError) as ex:
+                    errors.append(ex)
+
+        threads = [
+            threading.Thread(target=mutator),
+            threading.Thread(target=mutator),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+        ]
+
+        for t in threads:
+            t.start()
+
+        time.sleep(0.2)
+        stop_event.set()
+
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Reader encountered exceptions during concurrent mutation: {errors}"
+
+    def test_coordinating_enqueue_while_dequeuing(
+        self,
+        empty_queue: TriageQueue,
+        patient_factory: Callable[..., PatientRecord],
+    ) -> None:
+        """Verify lock coordinates when one worker dequeues while another enqueues simultaneously."""
+        p1 = patient_factory(name="P1", triage_level=TriageLevel.CRITICAL, patient_id="PT-1")
+        p2 = patient_factory(name="P2", triage_level=TriageLevel.CRITICAL, patient_id="PT-2")
+        empty_queue.enqueue(p1)
+
+        barrier = threading.Barrier(2)
+        dequeued_result: list[PatientRecord | None] = []
+
+        def worker_dequeue() -> None:
+            barrier.wait()
+            dequeued_result.append(empty_queue.dequeue())
+
+        def worker_enqueue() -> None:
+            barrier.wait()
+            empty_queue.enqueue(p2)
+
+        t1 = threading.Thread(target=worker_dequeue)
+        t2 = threading.Thread(target=worker_enqueue)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert len(dequeued_result) == 1
+        # P1 was already at head, so it must be dequeued
+        assert dequeued_result[0] == p1
+        # P2 must still be in queue
+        assert len(empty_queue) == 1
+        assert empty_queue.dequeue() == p2
+
 
